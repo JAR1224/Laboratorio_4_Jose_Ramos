@@ -1,6 +1,9 @@
 #include <stdint.h>
 #include <math.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <stdio.h>
+#include <unistd.h>
 
 #include <libopencm3/stm32/rcc.h>
 #include <libopencm3/cm3/nvic.h>
@@ -17,12 +20,63 @@
 
 #include <libopencm3/stm32/fsmc.h>
 
+#include <libopencm3/stm32/adc.h>
 
 
+#define LED_DISCO_GREEN_PORT GPIOG
+#define LED_DISCO_GREEN_PIN GPIO13
+
+#define LED_DISCO_RED_PORT GPIOG
+#define LED_DISCO_RED_PIN GPIO14
 
 #define CONSOLE_UART	USART1
 
 #define d2r(d) ((d) * 6.2831853 / 360.0)
+
+#define conversion_factor 0.00241758
+
+//--------------------------------------------------------------------------
+//adc.c
+//--------------------------------------------------------------------------
+
+static void adc_setup(void)
+{
+	gpio_mode_setup(GPIOA, GPIO_MODE_ANALOG, GPIO_PUPD_NONE, GPIO0);
+	//gpio_mode_setup(GPIOA, GPIO_MODE_ANALOG, GPIO_PUPD_NONE, GPIO1);
+	gpio_mode_setup(GPIOA, GPIO_MODE_INPUT, GPIO_PUPD_NONE, GPIO1);
+
+	adc_power_off(ADC1);
+	adc_disable_scan_mode(ADC1);
+	adc_set_sample_time_on_all_channels(ADC1, ADC_SMPR_SMP_3CYC);
+
+	adc_power_on(ADC1);
+
+}
+
+static void adc_init(void)
+{
+
+	rcc_periph_clock_enable(RCC_ADC1);
+	/* green led for ticking */
+	gpio_mode_setup(LED_DISCO_GREEN_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE,LED_DISCO_GREEN_PIN);
+	gpio_mode_setup(LED_DISCO_RED_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE,LED_DISCO_RED_PIN);
+
+}
+
+static uint16_t read_adc_naiive(uint8_t channel)
+{
+	uint8_t channel_array[16];
+	channel_array[0] = channel;
+	adc_set_regular_sequence(ADC1, 1, channel_array);
+	adc_start_conversion_regular(ADC1);
+	while (!adc_eoc(ADC1));
+	uint16_t reg16 = adc_read_regular(ADC1);
+	return reg16;
+}
+
+//--------------------------------------------------------------------------
+//adc.c
+//--------------------------------------------------------------------------
 
 
 //--------------------------------------------------------------------------
@@ -643,6 +697,8 @@ print_decimal(int num)
 	return len; /* number of characters printed */
 }
 
+
+
 char *axes[] = { "X: ", "Y: ", "Z: " };
 //--------------------------------------------------------------------------
 //spi.c
@@ -984,26 +1040,14 @@ initialize_display(const struct tft_command cmds[])
 	 * that changes the pointer we send to the command function.
 	 */
 	while (cmds[i].cmd) {
-		console_puts("CMD: ");
-		print_hex(cmds[i].cmd);
-		console_puts(", ");
-		if (cmds[i].n_args) {
-			console_puts("ARGS: ");
-			for (j = 0; j < cmds[i].n_args; j++) {
-				print_hex(cmd_args[arg_offset+j]);
-				console_puts(", ");
-			}
-		}
-		console_puts("DELAY: ");
-		print_decimal(cmds[i].delay);
-		console_puts("ms\n");
+
 
 		lcd_command(cmds[i].cmd, cmds[i].delay, cmds[i].n_args,
 			&cmd_args[arg_offset]);
 		arg_offset += cmds[i].n_args;
 		i++;
 	}
-	console_puts("Done.\n");
+	//console_puts("Done.\n");
 }
 
 /* prototype for test_image */
@@ -1135,22 +1179,22 @@ lcd_spi_init(void)
 	//spi_enable_ss_output(LCD_SPI);
 	//spi_enable(LCD_SPI);
 
-	put_status("\nBefore init: ");
+	//put_status("\nBefore init: ");
 	//SPI_CR2(SPI5) |= SPI_CR2_SSOE;
 	//SPI_CR1(SPI5) = cr_tmp;
 	spi_init();
-	put_status("After init: ");
+	//put_status("After init: ");
 
 	/* Set up the display */
 	console_puts("Initialize the display.\n");
 	initialize_display(initialization);
 
 	/* create a test image */
-	console_puts("Generating Test Image\n");
+	//console_puts("Generating Test Image\n");
 	test_image();
 
 	/* display it on the LCD */
-	console_puts("And ... voila\n");
+	//console_puts("And ... voila\n");
 	lcd_show_frame();
 }
 
@@ -1677,6 +1721,37 @@ void gfx_puts(char *s)
 	}
 }
 
+gfx_decimal(int num)
+{
+	int		ndx = 0;
+	char	buf[10];
+	char 	num_[10];
+	int		len = 0;
+	char	is_signed = 0;
+	int 	cnt = 0;
+
+	if (num < 0) {
+		is_signed++;
+		num = 0 - num;
+	}
+	buf[ndx++] = '\000';
+	do {
+		buf[ndx++] = (num % 10) + '0';
+		num = num / 10;
+	} while (num != 0);
+	ndx--;
+	if (is_signed != 0) {
+		gfx_puts('-');
+		len++;
+	}
+	while (buf[ndx] != '\000') {
+		num_[cnt++] = buf[ndx--];
+		len++;
+	}
+	num_[cnt] = buf[ndx];
+	gfx_puts(num_);
+	return len; /* number of characters printed */
+}
 
 void gfx_setCursor(int16_t x, int16_t y)
 {
@@ -1741,147 +1816,164 @@ uint16_t gfx_height(void)
 
 int main(void)
 {
-
-	int p1, p2, p3;
+	uint16_t adc_value;
 	int16_t vecs[3];
-	int16_t baseline[3];
-	int tmp, i;
+	int tmp, i, j;
 	int count;
-	uint32_t cr_tmp;
+	float battery_voltage;
+	int skip = 0;
+	int battery_uni = 0;
+	int battery_deci = 0;
+	int uart_flag = 0;
+	int alarm_flag = 0;
+	int button_flag = 0;
+	int button_count = 0;
+	int button_count2 = 0;
 
 	clock_setup();
 	console_setup(115200);
 
 	sdram_init();
+	console_puts("SDRAM initialized\n");
 	lcd_spi_init();
-	console_puts("LCD Initialized\n");
-	console_puts("Should have a checker pattern, press any key to proceed\n");
-	msleep(2000);
-	(void) console_getc(1); 
+	console_puts("LCD initialized\n");
+	adc_init();
+	adc_setup();
+	console_puts("ADC initialized\n");
+
+
 	gfx_init(lcd_draw_pixel, 240, 320);
 	gfx_fillScreen(LCD_GREY);
-	gfx_fillRoundRect(10, 10, 220, 220, 5, LCD_WHITE);
-	gfx_drawRoundRect(10, 10, 220, 220, 5, LCD_RED);
-	gfx_fillCircle(20, 250, 10, LCD_RED);
-	gfx_fillCircle(120, 250, 10, LCD_GREEN);
-	gfx_fillCircle(220, 250, 10, LCD_BLUE);
+	gfx_fillRoundRect(10, 10, 220, 300, 5, LCD_WHITE);
+	//gfx_drawRoundRect(10, 10, 220, 300, 5, LCD_GREEN);
 	gfx_setTextSize(2);
 	gfx_setCursor(15, 25);
-	gfx_puts("STM32F4-DISCO");
-	gfx_setTextSize(1);
-	gfx_setCursor(15, 49);
-	gfx_puts("Simple example to put some");
-	gfx_setCursor(15, 60);
-	gfx_puts("stuff on the LCD screen.");
+	gfx_puts("X:");
+	//gfx_setCursor(35, 49);
+	//gfx_puts("45");
+	gfx_setCursor(15, 95);
+	gfx_puts("Y:");
+	gfx_setCursor(15, 165);
+	gfx_puts("Z:");
+	gfx_setCursor(15, 235);
+	gfx_puts("Bateria:");
 	lcd_show_frame();
-	console_puts("Now it has a bit of structured graphics.\n");
-	console_puts("Press a key for some simple animation.\n");
-	msleep(2000);
-	(void) console_getc(1); 
-	gfx_setTextColor(LCD_YELLOW, LCD_BLACK);
-	gfx_setTextSize(3);
-	p1 = 0;
-	p2 = 45;
-	p3 = 90;
-
-/*
-	
-	rcc_periph_clock_enable(RCC_SPI5);
-	rcc_periph_clock_enable(RCC_GPIOF);
-	rcc_periph_clock_enable(RCC_GPIOC);
-
-	gpio_mode_setup(GPIOF, GPIO_MODE_AF, GPIO_PUPD_NONE,
-			GPIO7 | GPIO8 | GPIO9);
-	gpio_set_af(GPIOF, GPIO_AF5, GPIO7 | GPIO8 | GPIO9);
-	gpio_set_output_options(GPIOF, GPIO_OTYPE_PP, GPIO_OSPEED_25MHZ,
-				GPIO7 | GPIO9);
-
-	
-	gpio_mode_setup(GPIOC, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO1);
-	gpio_set(GPIOC, GPIO1);
-*/
-
-	//cr_tmp = SPI_CR1_BAUDRATE_FPCLK_DIV_64 |
-	//	 SPI_CR1_MSTR |
-	//	 SPI_CR1_SPE |
-	//	 SPI_CR1_CPHA |
-	//	 SPI_CR1_CPOL_CLK_TO_1_WHEN_IDLE;
 
 
-
-	baseline[0] = 0;
-	baseline[1] = 0;
-	baseline[2] = 0;
-	console_puts("MEMS demo (new version):\n");
-	console_puts("Press a key to read the registers\n");
-	console_getc(1);
-	tmp = read_reg(0x0f);
-	if (tmp != 0xD4) {
-		console_puts("Maybe this isn't a Gyroscope.\n");
-		print_decimal(tmp);
-	}
-	/*
-	 * These parameters are sort of random, clearly I need
-	 * set something. Based on the app note I reset the 'baseline'
-	 * values after 100 samples. But don't see a lot of change
-	 * when I move the board around. Z doesn't move at all but the
-	 * temperature reading is correct and the ID code returned is
-	 * as expected so the SPI code at least is working.
-	 */
+	//Configure gyroscope
 	write_reg(0x20, 0xcf);  /* Normal mode */
 	write_reg(0x21, 0x07);  /* standard filters */
 	write_reg(0x23, 0xb0);  /* 250 dps */
-	tmp = (int) read_reg(0x26);
-	console_puts("Temperature: ");
-	print_decimal(tmp);
-	console_puts(" C\n");
+
 
 	count = 0;
 	while (1) {
+		adc_value = read_adc_naiive(0);
 		tmp = read_xyz(vecs);
-		for (i = 0; i < 3; i++) {
-			int pad;
-			console_puts(axes[i]);
-			tmp = vecs[i] - baseline[i];
-			pad = print_decimal(tmp);
-			console_putc(',');
-			pad += print_decimal(vecs[i]);
-			console_putc(',');
-			pad += print_decimal(baseline[i]);
-			pad = 15 - pad;
-			while (pad--) {
-				console_puts(" ");
+		if (uart_flag == 1) {
+			if (button_count2 == 10) {
+				gpio_toggle(LED_DISCO_RED_PORT, LED_DISCO_RED_PIN);
+			}
+			for (i = 0; i < 3; i++) {
+				print_decimal(vecs[i]);
+				console_putc(',');
+			}
+			//print_decimal(adc_value);
+			//console_putc(',');
+			print_decimal(battery_voltage);
+			console_putc('\n');
+		} else {
+			gpio_clear(LED_DISCO_RED_PORT, LED_DISCO_RED_PIN);
+		}
+		if (alarm_flag == 1) {
+			gpio_set(LED_DISCO_GREEN_PORT, LED_DISCO_GREEN_PIN);
+		} else {
+			gpio_clear(LED_DISCO_GREEN_PORT, LED_DISCO_GREEN_PIN);
+		}
+
+		battery_voltage = conversion_factor*100*adc_value;
+
+		if (conversion_factor*adc_value <= 7)
+		{
+			alarm_flag = 1;
+		} else {
+			alarm_flag = 0;
+		}
+
+		if (skip++ == 100) {
+			skip=0;
+			battery_uni = battery_voltage/100;
+			battery_deci = (battery_voltage-(battery_uni*100))/10;
+			gfx_fillScreen(LCD_GREY);
+			gfx_fillRoundRect(10, 10, 220, 300, 5, LCD_WHITE);
+			//gfx_drawRoundRect(10, 10, 220, 300, 5, LCD_GREEN);
+			gfx_setTextSize(2);
+			gfx_setCursor(15, 25);
+			gfx_puts("X:");
+			gfx_setCursor(35, 49);
+			gfx_decimal(vecs[0]);
+			gfx_setCursor(15, 95);
+			gfx_puts("Y:");
+			gfx_setCursor(35, 119);
+			gfx_decimal(vecs[1]);
+			gfx_setCursor(15, 165);
+			gfx_puts("Z:");
+			gfx_setCursor(35, 189);
+			gfx_decimal(vecs[2]);
+			gfx_setCursor(15, 235);
+			gfx_puts("Bateria:");
+			gfx_setCursor(35, 259);
+			gfx_decimal(battery_uni);
+			gfx_setCursor(55, 259);
+			gfx_puts(".");
+			gfx_setCursor(65, 259);
+			gfx_decimal(battery_uni);
+			gfx_setCursor(85, 259);
+			gfx_puts("V");
+			if (alarm_flag == 1)
+			{
+				gfx_fillCircle(117, 267, 10, LCD_RED);
+			} else {
+				gfx_fillCircle(117, 267, 10, LCD_GREEN);
+			}
+			if (uart_flag == 1)
+			{
+				gfx_fillCircle(157, 267, 10, LCD_GREEN);
+			} else {
+				gfx_fillCircle(157, 267, 10, LCD_RED);
+			}
+			
+			lcd_show_frame();
+		}
+
+		/* LED on/off */
+		//gpio_toggle(LED_DISCO_GREEN_PORT, LED_DISCO_GREEN_PIN);
+		//gpio_toggle(LED_DISCO_GREEN_PORT, LED_DISCO_RED_PIN);
+		//msleep(1000);
+
+		if (gpio_get(GPIOA, GPIO1)) {
+			if (button_flag==0) {
+				uart_flag=uart_flag==1 ? 0 : 1;
+				button_flag = 1;
+				button_count = 0;
 			}
 		}
-		console_putc('\r');
-		if (count == 100) {
-			baseline[0] = vecs[0];
-			baseline[1] = vecs[1];
-			baseline[2] = vecs[2];
-		} else {
-			count++;
+
+		for (j = 0; j < 1250000; j++) { /* Wait a bit. 25000000*/
+			__asm__("NOP");
+		}
+		if (button_count2 == 10) {
+			button_count2=0;
+		}
+		button_count2++;
+		if (button_flag == 1) {
+			button_count++;
+		}
+		if (button_count==5) {
+			button_flag = 0;
 		}
 
-		gfx_fillScreen(LCD_BLACK);
-		gfx_setCursor(15, 36);
-		gfx_puts("PLANETS!");
-		gfx_fillCircle(120, 160, 40, LCD_YELLOW);
-		gfx_drawCircle(120, 160, 55, LCD_GREY);
-		gfx_drawCircle(120, 160, 75, LCD_GREY);
-		gfx_drawCircle(120, 160, 100, LCD_GREY);
-
-		gfx_fillCircle(120 + (sin(d2r(p1)) * 55),
-			       160 + (cos(d2r(p1)) * 55), 5, LCD_RED);
-		gfx_fillCircle(120 + (sin(d2r(p2)) * 75),
-			       160 + (cos(d2r(p2)) * 75), 10, LCD_WHITE);
-		gfx_fillCircle(120 + (sin(d2r(p3)) * 100),
-			       160 + (cos(d2r(p3)) * 100), 8, LCD_BLUE);
-		p1 = (p1 + 3) % 360;
-		p2 = (p2 + 2) % 360;
-		p3 = (p3 + 1) % 360;
-		lcd_show_frame();		
-
-		msleep(1000);
 	}
 
 }
+
