@@ -41,7 +41,7 @@ while( not is_connected ):
     print("Waiting for MQTT connection ...")
 
 serialPort = serial.Serial(
-    port="COM5", baudrate=115200, bytesize=8, timeout=2, stopbits=serial.STOPBITS_ONE
+    port="COM6", baudrate=115200, bytesize=8, timeout=2, stopbits=serial.STOPBITS_ONE
 )
 print("Serial Begin")
 
